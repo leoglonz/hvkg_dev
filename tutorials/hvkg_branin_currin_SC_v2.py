@@ -140,22 +140,30 @@ def gen_init_data(n: int):
     return train_x, train_obj, train_sc
 
 
-def initialize_model(train_x, train_obj, train_sc, state_dict=None):
-    """Initializes a ModelList with Matern 5/2 Kernel and returns the model and its MLL.
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.constraints import GreaterThan
 
-    Note: a batched model could also be used here.
-    """
+# ... (imports for likelihood and constraints) ...
+
+# The third argument, train_sc, is removed from the function definition.
+def initialize_model(train_x, train_obj, state_dict=None):
+    """Initializes a ModelList with Matern 5/2 Kernel and returns the model and its MLL."""
+    # ... (the rest of the function is the same as the previous fix) ...
     models = []
     for i in range(train_obj.shape[-1]):
-        m = SingleTaskGP(  # also tried GradientSingleTaskGP
+        # Define a likelihood with a noise constraint
+        likelihood = GaussianLikelihood(
+            noise_constraint=GreaterThan(1e-6) # Prevents noise from becoming too small
+        )
+        
+        m = SingleTaskGP(
             train_x,
             train_obj[:, i : i + 1],
-            train_sc[:, i: i+1], #.unsqueeze(-1),  #### Add SC data
-            train_Yvar=torch.full_like(train_obj[:, i : i + 1], 1e-6),
+            likelihood=likelihood, # Pass the custom likelihood here
             covar_module=ScaleKernel(
                 MaternKernel(
                     nu=2.5,
-                    ard_num_dims=train_x.shape[-1],  # Add 1 for gradient index if using GradientSingleTaskGP
+                    ard_num_dims=train_x.shape[-1],
                     lengthscale_prior=GammaPrior(2.0, 2.0),
                 ),
                 outputscale_prior=GammaPrior(2.0, 0.15),
@@ -164,12 +172,6 @@ def initialize_model(train_x, train_obj, train_sc, state_dict=None):
         models.append(m)
     model = ModelListGP(*models)
     mll = SumMarginalLogLikelihood(model.likelihood, model)
-
-    # from tutorials.sc_utils import SCMarginalLogLikelihood
-    # mll = SCMarginalLogLikelihood(
-    #     model.likelihood, model, train_x, train_sc, lambda_reg=1.0
-    # )
-
 
     if state_dict is not None:
         model.load_state_dict(state_dict=state_dict)
@@ -318,76 +320,17 @@ def optimize_HVKG_and_get_obs(
     return new_x, new_obj, new_sc
 
 
-# def get_sensitivity_closure(
-#     mll: SumMarginalLogLikelihood,
-#     optimizer: torch.optim.Optimizer,
-#     normalized_train_x: torch.Tensor,
-#     train_sc: torch.Tensor,
-#     lambda_reg: float = 1.0,
-# ):
-#     """
-#     Returns a custom closure that computes the MLL and a sensitivity-based loss.
-
-#     Args:
-#         mll: The SumMarginalLogLikelihood object.
-#         optimizer: The optimizer that is being used to train the model.
-#         normalized_train_x: The normalized training inputs for the model.
-#         train_sc: The true sensitivity values (Jacobians).
-#         lambda_reg: The weight for the sensitivity loss term.
-    
-#     Returns:
-#         A closure callable that returns the total loss.
-#     """
-#     def closure():
-#         optimizer.zero_grad()
-#         output = mll.model(*mll.model.train_inputs)
-#         # 1. Calculate standard MLL loss
-#         loss = -mll(output, mll.model.train_targets).sum()
-
-#         # 2. Calculate sensitivity loss
-#         sc_loss = 0
-#         s_input = normalized_train_x[:, -1].clone().requires_grad_(True)
-#         temp_x = torch.cat([normalized_train_x[:, :-1], s_input.unsqueeze(-1)], dim=-1)
-
-#         # Iterate through each model/objective
-#         for i, sub_model in enumerate(mll.model.models):
-#             # Get the posterior mean from the surrogate model
-#             posterior = sub_model.posterior(temp_x)
-#             pred_obj = posterior.mean
-            
-#             # Get the jacobian of the surrogate's prediction w.r.t 's'
-#             pred_sc_i = batchJacobian_AD(pred_obj, s_input,True, True)
-#             true_sc_i = train_sc[:, i : i + 1]
-            
-#             # Add the MSE loss to the total sensitivity loss
-#             sc_loss += torch.nn.MSELoss()(pred_sc_i, true_sc_i)
-
-#         # 3. Combine the losses and backpropagate
-#         total_loss = loss + lambda_reg * sc_loss
-#         total_loss.backward()
-#         return total_loss
-
-#     return closure
-
-# from botorch.optim.utils import _get_extra_mll_args
-
-def get_sensitivity_closure(
+def get_adam_compatible_closure(
     mll: SumMarginalLogLikelihood,
     normalized_train_x: torch.Tensor,
     train_sc: torch.Tensor,
     lambda_reg: float = 1.0,
 ):
     """
-    Returns a custom closure for the SciPy optimizer.
-
-    This closure computes and returns a tuple of (loss, gradients).
+    Returns a simple closure for a PyTorch optimizer like Adam.
+    This closure computes and returns only the total loss tensor.
     """
     def closure():
-        # Get the parameters to be optimized
-        parameters = {
-            name: p for name, p in mll.named_parameters() if p.requires_grad
-        }
-        
         # 1. Calculate standard MLL loss
         output = mll.model(*mll.model.train_inputs)
         loss = -mll(output, mll.model.train_targets).sum()
@@ -395,18 +338,12 @@ def get_sensitivity_closure(
         # 2. Calculate sensitivity loss
         sc_loss = 0
         s_input = normalized_train_x[:, -1].clone().requires_grad_(True)
-        # We need a fresh copy of the other inputs to build the graph
-        other_inputs = normalized_train_x[:, :-1].clone()
-        temp_x = torch.cat([other_inputs, s_input.unsqueeze(-1)], dim=-1)
+        temp_x = torch.cat([normalized_train_x[:, :-1], s_input.unsqueeze(-1)], dim=-1)
 
-        # Iterate through each model/objective
         for i, sub_model in enumerate(mll.model.models):
             posterior = sub_model.posterior(temp_x)
             pred_obj = posterior.mean
             
-            # Calculate the jacobian of the surrogate's mean prediction
-            # We need to compute gradients with respect to the model's parameters,
-            # so create_graph=True is important.
             (pred_sc_i,) = torch.autograd.grad(
                 outputs=pred_obj.sum(), inputs=s_input, create_graph=True
             )
@@ -414,18 +351,22 @@ def get_sensitivity_closure(
             true_sc_i = train_sc[:, i : i + 1]
             sc_loss += torch.nn.MSELoss()(pred_sc_i.unsqueeze(-1), true_sc_i)
 
-        # 3. Combine losses and compute gradients for the optimizer
-        total_loss = loss + lambda_reg * sc_loss
-        
-        # Compute gradients and flatten them into a single tensor
-        grads = torch.autograd.grad(total_loss, parameters.values())
-        grad_t = torch.cat([g.contiguous().view(-1) for g in grads])
-        
-        # Return the loss and gradients as a tuple
-        return total_loss, grad_t
+        # 3. Return the combined loss
+        return loss + lambda_reg * sc_loss
 
     return closure
 
+
+def fit_model_with_adam(mll, closure, n_epochs=100, lr=0.01):
+    """Fits the MLL model using the Adam optimizer."""
+    optimizer = torch.optim.Adam(mll.parameters(), lr=lr)
+    mll.train()
+    for _ in range(n_epochs):
+        optimizer.zero_grad()
+        loss = closure()
+        loss.backward()
+        optimizer.step()
+    mll.eval()
 
 
 
@@ -453,18 +394,18 @@ while total_cost < EVAL_BUDGET * cost_func(1):
     normalized_train_x_kg = normalize(train_x_kg, BC.bounds)
 
     # reinitialize the models so they are ready for fitting on next iteration
-    mll, model = initialize_model(normalized_train_x_kg, train_obj_kg, train_sc_kg)
-
-    # Get the custom sensitivity closure
-    closure = get_sensitivity_closure(
+    mll, model = initialize_model(normalized_train_x_kg, train_obj_kg)
+    
+    # Get the new Adam-compatible closure
+    adam_closure = get_adam_compatible_closure(
         mll,
         normalized_train_x=normalized_train_x_kg,
         train_sc=train_sc_kg,
         lambda_reg=1.0,  # Adjust this weight as needed
     )
 
-    # Fit the model using our custom closure
-    fit_gpytorch_mll(mll=mll, closure=closure)
+    # Fit the model using our new Adam-based function
+    fit_model_with_adam(mll, adam_closure, n_epochs=150, lr=0.01)
     ############################################################################
 
     # model.eval()
