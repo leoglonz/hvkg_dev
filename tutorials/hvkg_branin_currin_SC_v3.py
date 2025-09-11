@@ -4,13 +4,13 @@ from typing import Callable, Dict
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from j_computer import batchJacobian_AD
 from botorch.test_functions.multi_objective_multi_fidelity import MOMFBraninCurrin
 
-# from botorch.fit import FitGPyTorchMLL, _fit_fallback
-# from tutorials.sc_utils import SCMarginalLogLikelihood
-# # Register our custom MLL with the dispatcher to use _fit_fallback
-# FitGPyTorchMLL.register(SCMarginalLogLikelihood)(_fit_fallback)
+from j_computer import batchJacobian_AD
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message="Very small noise values detected")
+
 
 
 verbose = True  # set to True to see output during optimization
@@ -19,9 +19,10 @@ SMOKE_TEST = True #os.environ.get("SMOKE_TEST")
 
 
 
+
 tkwargs = {  # Tkwargs is a dictionary contaning data about data type and data device
     "dtype": torch.double,
-    "device": torch.device("cuda:6" if torch.cuda.is_available() else "cpu"),
+    "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
 }
 
 if SMOKE_TEST:
@@ -31,12 +32,13 @@ BC = MOMFBraninCurrin(negate=True).to(**tkwargs)
 dim_x = BC.dim
 dim_y = BC.num_objectives
 
-ref_point = torch.zeros(dim_y, **tkwargs)
+ref_point = torch.zeros(dim_y, **tkwargs) 
+print(f"Reference point used: {ref_point}")  # Should be (0,0) for this problem
 
 
 BATCH_SIZE = 1  # For batch optimization, BATCH_SIZE should be greater than 1
 # This evaluation budget is set to be very low to make the notebook run fast. This should be much higher.
-EVAL_BUDGET = 2.05  # in terms of the number of full-fidelity evaluations. ##### changed
+EVAL_BUDGET = 2  # in terms of the number of full-fidelity evaluations. ##### Tried 5 and didn't work
 n_INIT = 2  # Initialization budget in terms of the number of full-fidelity evaluations
 # Number of Monte Carlo samples, used to approximate MOMF
 MC_SAMPLES = 2 if SMOKE_TEST else 128
@@ -88,6 +90,8 @@ from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.mlls.sum_marginal_log_likelihood import SumMarginalLogLikelihood
 from gpytorch.priors import GammaPrior
 
+# from sc_mll import SensitivityAwareGP, SensitivityConstrainedMLL
+
 
 def inv_transform(u):
     # define inverse transform to sample from the probability distribution with
@@ -121,7 +125,7 @@ def gen_init_data(n: int):
         new_x[:, -1] = inv_transform(new_x[:, -1])
         total_cost += cost_callable(new_x)
         train_x = torch.cat([train_x, new_x], dim=0)
-    
+
     ############################ For SC
     train_x = train_x[:-1]  # [x1, x2, s]
 
@@ -140,26 +144,18 @@ def gen_init_data(n: int):
     return train_x, train_obj, train_sc
 
 
-from gpytorch.likelihoods import GaussianLikelihood
-from gpytorch.constraints import GreaterThan
+def initialize_model(train_x, train_obj, train_sc, state_dict=None):
+    """Initializes a ModelList with Matern 5/2 Kernel and returns the model and its MLL.
 
-# ... (imports for likelihood and constraints) ...
-
-# The third argument, train_sc, is removed from the function definition.
-def initialize_model(train_x, train_obj, state_dict=None):
-    """Initializes a ModelList with Matern 5/2 Kernel and returns the model and its MLL."""
-    # ... (the rest of the function is the same as the previous fix) ...
+    Note: a batched model could also be used here.
+    """
     models = []
     for i in range(train_obj.shape[-1]):
-        # Define a likelihood with a noise constraint
-        likelihood = GaussianLikelihood(
-            noise_constraint=GreaterThan(1e-6) # Prevents noise from becoming too small
-        )
-        
-        m = SingleTaskGP(
+        m = SingleTaskGP(  #SensitivityAwareGP
             train_x,
             train_obj[:, i : i + 1],
-            likelihood=likelihood, # Pass the custom likelihood here
+            train_sc[:, i : i + 1],
+            train_Yvar=torch.full_like(train_obj[:, i : i + 1], 1e-6),
             covar_module=ScaleKernel(
                 MaternKernel(
                     nu=2.5,
@@ -171,8 +167,7 @@ def initialize_model(train_x, train_obj, state_dict=None):
         )
         models.append(m)
     model = ModelListGP(*models)
-    mll = SumMarginalLogLikelihood(model.likelihood, model)
-
+    mll = SumMarginalLogLikelihood(model.likelihood, model) #, mll_cls=SensitivityConstrainedMLL)
     if state_dict is not None:
         model.load_state_dict(state_dict=state_dict)
     return mll, model
@@ -195,8 +190,6 @@ from botorch.acquisition.multi_objective.hypervolume_knowledge_gradient import (
 from botorch.acquisition.utils import project_to_target_fidelity
 from botorch.models.deterministic import GenericDeterministicModel
 from torch import Tensor
-
-
 
 NUM_INNER_MC_SAMPLES = 2 if SMOKE_TEST else 32
 NUM_PARETO = 1 if SMOKE_TEST else 10
@@ -320,93 +313,29 @@ def optimize_HVKG_and_get_obs(
     return new_x, new_obj, new_sc
 
 
-def get_adam_compatible_closure(
-    mll: SumMarginalLogLikelihood,
-    normalized_train_x: torch.Tensor,
-    train_sc: torch.Tensor,
-    lambda_reg: float = 1.0,
-):
-    """
-    Returns a simple closure for a PyTorch optimizer like Adam.
-    This closure computes and returns only the total loss tensor.
-    """
-    def closure():
-        # 1. Calculate standard MLL loss
-        output = mll.model(*mll.model.train_inputs)
-        loss = -mll(output, mll.model.train_targets).sum()
-
-        # 2. Calculate sensitivity loss
-        sc_loss = 0
-        s_input = normalized_train_x[:, -1].clone().requires_grad_(True)
-        temp_x = torch.cat([normalized_train_x[:, :-1], s_input.unsqueeze(-1)], dim=-1)
-
-        for i, sub_model in enumerate(mll.model.models):
-            posterior = sub_model.posterior(temp_x)
-            pred_obj = posterior.mean
-            
-            (pred_sc_i,) = torch.autograd.grad(
-                outputs=pred_obj.sum(), inputs=s_input, create_graph=True
-            )
-            
-            true_sc_i = train_sc[:, i : i + 1]
-            sc_loss += torch.nn.MSELoss()(pred_sc_i.unsqueeze(-1), true_sc_i)
-
-        # 3. Return the combined loss
-        return loss + lambda_reg * sc_loss
-
-    return closure
-
-
-def fit_model_with_adam(mll, closure, n_epochs=100, lr=0.01):
-    """Fits the MLL model using the Adam optimizer."""
-    optimizer = torch.optim.Adam(mll.parameters(), lr=lr)
-    mll.train()
-    for _ in range(n_epochs):
-        optimizer.zero_grad()
-        loss = closure()
-        loss.backward()
-        optimizer.step()
-    mll.eval()
-
-
-
 from botorch import fit_gpytorch_mll
 
 
-################################################################################
-############################# Optimization Loop ################################
+
 torch.manual_seed(0)
-train_x_kg, train_obj_kg, train_sc_kg = gen_init_data(n_INIT)  #### Add SC data
+train_x_kg, train_obj_kg, train_sc_kg = gen_init_data(n_INIT)
 MF_n_INIT = train_x_kg.shape[0]
 iteration = 0
 total_cost = cost_callable(train_x_kg).sum().item()
 
+mse_over_iter = []
 
 while total_cost < EVAL_BUDGET * cost_func(1):
     if verbose:
         print(f"cost: {total_cost}")
 
-        with open("/projects/mhpi/leoglonz/project_silmaril/iclr_examples/HV-KG/out/hvkg_bc_sc_cost.txt", "w") as f:
+        with open("/storage/home/lgl5139/work/code/iclr25/hvkg_dev/out/hvkg_bc_cost_sc.txt", "a") as f:
             f.write(f"Iteration {iteration}, Cost: {total_cost}\n")
 
-    ############################################################################
-    # Normalize the training data
-    normalized_train_x_kg = normalize(train_x_kg, BC.bounds)
-
     # reinitialize the models so they are ready for fitting on next iteration
-    mll, model = initialize_model(normalized_train_x_kg, train_obj_kg)
-    
-    # Get the new Adam-compatible closure
-    adam_closure = get_adam_compatible_closure(
-        mll,
-        normalized_train_x=normalized_train_x_kg,
-        train_sc=train_sc_kg,
-        lambda_reg=1.0,  # Adjust this weight as needed
-    )
+    mll, model = initialize_model(normalize(train_x_kg, BC.bounds), train_obj_kg, train_sc_kg)
 
-    # Fit the model using our new Adam-based function
-    fit_model_with_adam(mll, adam_closure, n_epochs=150, lr=0.01)
-    ############################################################################
+    fit_gpytorch_mll(mll=mll)  # Fit the model
 
     # model.eval()
     # with torch.no_grad():
@@ -425,28 +354,28 @@ while total_cost < EVAL_BUDGET * cost_func(1):
         BATCH_SIZE=BATCH_SIZE,
         cost_call=cost_callable,
     )
+    
+    # mse = torch.mean((preds - train_obj_kg) ** 2).item()
+    # mse_over_iter.append(mse)
 
-
-    # Updating train_x and train_obj, train_sc
+    # Updating train_x and train_obj
     train_x_kg = torch.cat([train_x_kg, new_x], dim=0)
     train_obj_kg = torch.cat([train_obj_kg, new_obj], dim=0)
     train_sc_kg = torch.cat([train_sc_kg, new_sc], dim=0)  #### Add SC data
-
     iteration += 1
     total_cost += cost_callable(new_x).sum().item()
 
-################################################################################
-############################# End Optimization Loop ############################
+if total_cost >= EVAL_BUDGET * cost_func(1):
+    print(f"Cost threshold exceeded: {total_cost} >> {EVAL_BUDGET * cost_func(1)}")
 
-
-
-# ### Plotting surrogate vs target objective
+ 
 # dif = np.abs(model.train_targets[0].cpu() - preds_list[0])
 # import matplotlib.pyplot as plt
 
 # plt.figure()
 # plt.plot(model.train_targets[0].cpu(), preds_list[0], "o", color="blue")
 # # plt.plot(dif, range(len(dif)), "x", color="red")
+
 
 # # add 1:1 line
 # min_val = min(model.train_targets[0].min().item(), preds_list[0].min().item())
@@ -456,7 +385,7 @@ while total_cost < EVAL_BUDGET * cost_func(1):
 # plt.ylabel("Surrogate")
 # plt.xlabel("Target")
 # plt.title("Surrogate vs Target Objective")
-# plt.savefig("/projects/mhpi/leoglonz/project_silmaril/iclr_examples/HV-KG/figs/surrogate_temp.png")
+# plt.savefig("/projects/mhpi/leoglonz/project_silmaril/surrogate_examples/hvkg/results/surrogate_temp.png")
 
 
 
@@ -604,6 +533,8 @@ for i in range(MF_n_INIT, train_x_kg.shape[0] + 1, 5):
     costs.append(cost_callable(train_x_kg[:i]).sum().item())
 
 
+print("costs", costs)
+print("regret", np.log10(BC.max_hv - np.array(hvs_kg)))
 
 plt.plot(
     costs, np.log10(BC.max_hv - np.array(hvs_kg)), "--", marker="d", ms=10, label="HVKG"
@@ -612,4 +543,4 @@ plt.ylabel("Log Inference Hypervolume Regret")
 plt.xlabel("Cost")
 plt.legend()
 
-plt.savefig("/projects/mhpi/leoglonz/project_silmaril/hvkg_dev/figs/hvkg1.png")
+plt.savefig("/storage/home/lgl5139/work/code/iclr25/hvkg_dev/out/figs/hvkg_sc.png")

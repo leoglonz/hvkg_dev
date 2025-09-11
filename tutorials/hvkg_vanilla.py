@@ -4,8 +4,12 @@ from typing import Callable, Dict
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from j_computer import batchJacobian_AD
 from botorch.test_functions.multi_objective_multi_fidelity import MOMFBraninCurrin
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message="Very small noise values detected")
+
 
 
 verbose = True  # set to True to see output during optimization
@@ -14,9 +18,10 @@ SMOKE_TEST = True #os.environ.get("SMOKE_TEST")
 
 
 
+
 tkwargs = {  # Tkwargs is a dictionary contaning data about data type and data device
     "dtype": torch.double,
-    "device": torch.device("cuda:6" if torch.cuda.is_available() else "cpu"),
+    "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
 }
 
 if SMOKE_TEST:
@@ -26,12 +31,13 @@ BC = MOMFBraninCurrin(negate=True).to(**tkwargs)
 dim_x = BC.dim
 dim_y = BC.num_objectives
 
-ref_point = torch.zeros(dim_y, **tkwargs)
+ref_point = torch.zeros(dim_y, **tkwargs) 
+print(f"Reference point used: {ref_point}")  # Should be (0,0) for this problem
 
 
 BATCH_SIZE = 1  # For batch optimization, BATCH_SIZE should be greater than 1
 # This evaluation budget is set to be very low to make the notebook run fast. This should be much higher.
-EVAL_BUDGET = 2.05  # in terms of the number of full-fidelity evaluations. ##### changed
+EVAL_BUDGET = 2  # in terms of the number of full-fidelity evaluations. ##### Tried 5 and didn't work
 n_INIT = 2  # Initialization budget in terms of the number of full-fidelity evaluations
 # Number of Monte Carlo samples, used to approximate MOMF
 MC_SAMPLES = 2 if SMOKE_TEST else 128
@@ -116,40 +122,23 @@ def gen_init_data(n: int):
         new_x[:, -1] = inv_transform(new_x[:, -1])
         total_cost += cost_callable(new_x)
         train_x = torch.cat([train_x, new_x], dim=0)
-    
-    ############################ For SC
-    train_x = train_x[:-1]  # [x1, x2, s]
-
-    train_s = train_x[:, -1]
-    train_s = train_s.requires_grad_(True)
-    train_x = torch.cat([train_x[:, :-1], train_s.unsqueeze(-1)], dim=-1)
+    train_x = train_x[:-1]
 
     train_obj = BC(train_x)  ## Get synthetic data
-    train_sc = batchJacobian_AD(train_obj, train_s, True, True)  # SC on s- fidelity
 
-    train_x = train_x.detach()
-    train_obj = train_obj.detach()
-    train_sc = train_sc.detach()
-    ############################
-
-    return train_x, train_obj, train_sc
+    return train_x, train_obj
 
 
-def initialize_model(train_x, train_obj, train_sc, state_dict=None):
+def initialize_model(train_x, train_obj, state_dict=None):
     """Initializes a ModelList with Matern 5/2 Kernel and returns the model and its MLL.
 
     Note: a batched model could also be used here.
     """
     models = []
-    # Normalize the training data before passing it to the model
-    train_x_normalized = normalize(train_x, BC.bounds)
-    
     for i in range(train_obj.shape[-1]):
         m = SingleTaskGP(
-            train_x_normalized,
+            train_x,
             train_obj[:, i : i + 1],
-            # The train_sc is not directly used by SingleTaskGP, 
-            # but our custom MLL will use it.
             train_Yvar=torch.full_like(train_obj[:, i : i + 1], 1e-6),
             covar_module=ScaleKernel(
                 MaternKernel(
@@ -162,14 +151,7 @@ def initialize_model(train_x, train_obj, train_sc, state_dict=None):
         )
         models.append(m)
     model = ModelListGP(*models)
-
-    from tutorials.sc_utils import SCMarginalLogLikelihood
-    # Pass the normalized training data to the MLL
-    mll = SCMarginalLogLikelihood(
-        model.likelihood, model, train_x_normalized, train_sc, lambda_reg=1.0
-    )
-
-
+    mll = SumMarginalLogLikelihood(model.likelihood, model)
     if state_dict is not None:
         model.load_state_dict(state_dict=state_dict)
     return mll, model
@@ -192,8 +174,6 @@ from botorch.acquisition.multi_objective.hypervolume_knowledge_gradient import (
 from botorch.acquisition.utils import project_to_target_fidelity
 from botorch.models.deterministic import GenericDeterministicModel
 from torch import Tensor
-
-
 
 NUM_INNER_MC_SAMPLES = 2 if SMOKE_TEST else 32
 NUM_PARETO = 1 if SMOKE_TEST else 10
@@ -302,86 +282,72 @@ def optimize_HVKG_and_get_obs(
         candidates[:, -1] = 0.0
     # observe new values
     new_x = unnormalize(candidates.detach(), bounds=BC.bounds)
-
-    new_s = new_x[:, -1]
-    new_s = new_s.requires_grad_(True)
-    new_x = torch.cat([new_x[:, :-1], new_s.unsqueeze(-1)], dim=-1)
-
     new_obj = BC(new_x)
-    new_sc = batchJacobian_AD(new_obj, new_s, True, True)
-
-    new_x = new_x.detach()
-    new_obj = new_obj.detach()
-    new_sc = new_sc.detach()
-
-    return new_x, new_obj, new_sc
+    return new_x, new_obj
 
 
 from botorch import fit_gpytorch_mll
 
 
 
-################################################################################
-############################# Optimization Loop ################################
 torch.manual_seed(0)
-train_x_kg, train_obj_kg, train_sc_kg = gen_init_data(n_INIT)  #### Add SC data
+train_x_kg, train_obj_kg = gen_init_data(n_INIT)
 MF_n_INIT = train_x_kg.shape[0]
 iteration = 0
 total_cost = cost_callable(train_x_kg).sum().item()
 
+mse_over_iter = []
 
 while total_cost < EVAL_BUDGET * cost_func(1):
     if verbose:
         print(f"cost: {total_cost}")
 
-        with open("/projects/mhpi/leoglonz/project_silmaril/iclr_examples/HV-KG/out/hvkg_bc_sc_cost.txt", "w") as f:
+        with open("/storage/home/lgl5139/work/code/iclr25/hvkg_dev/out/hvkg_bc_cost.txt", "a") as f:
             f.write(f"Iteration {iteration}, Cost: {total_cost}\n")
 
     # reinitialize the models so they are ready for fitting on next iteration
-    mll, model = initialize_model(train_x_kg, train_obj_kg, train_sc_kg)  #### Add SC data
+    mll, model = initialize_model(normalize(train_x_kg, BC.bounds), train_obj_kg)
 
     fit_gpytorch_mll(mll=mll)  # Fit the model
-    # optimize acquisition functions and get new observations
 
-    model.eval()
-    with torch.no_grad():
-        preds = model(*model.train_inputs)
+    # model.eval()
+    # with torch.no_grad():
+    #     preds = model(*model.train_inputs)
 
-    preds_list = []
-    for i, mvn in enumerate(preds):
-        mean = mvn.mean      # tensor of shape (48,)
-        # print(f"Objective {i} mean:", mean)  # print first 5
-        preds_list.append(mean.detach().cpu())
+    # preds_list = []
+    # for i, mvn in enumerate(preds):
+    #     mean = mvn.mean      # tensor of shape (48,)
+    #     # print(f"Objective {i} mean:", mean)  # print first 5
+    #     preds_list.append(mean.detach().cpu())
 
-    new_x, new_obj, new_sc = optimize_HVKG_and_get_obs(
+    new_x, new_obj = optimize_HVKG_and_get_obs(
         model=model,
         ref_point=ref_point,
         standard_bounds=standard_bounds,
         BATCH_SIZE=BATCH_SIZE,
         cost_call=cost_callable,
     )
+    
+    # mse = torch.mean((preds - train_obj_kg) ** 2).item()
+    # mse_over_iter.append(mse)
 
-
-    # Updating train_x and train_obj, train_sc
+    # Updating train_x and train_obj
     train_x_kg = torch.cat([train_x_kg, new_x], dim=0)
     train_obj_kg = torch.cat([train_obj_kg, new_obj], dim=0)
-    train_sc_kg = torch.cat([train_sc_kg, new_sc], dim=0)  #### Add SC data
-
     iteration += 1
     total_cost += cost_callable(new_x).sum().item()
 
-################################################################################
-############################# End Optimization Loop ############################
+if total_cost >= EVAL_BUDGET * cost_func(1):
+    print(f"Cost threshold exceeded: {total_cost} >> {EVAL_BUDGET * cost_func(1)}")
 
-
-
-# ### Plotting surrogate vs target objective
+ 
 # dif = np.abs(model.train_targets[0].cpu() - preds_list[0])
 # import matplotlib.pyplot as plt
 
 # plt.figure()
 # plt.plot(model.train_targets[0].cpu(), preds_list[0], "o", color="blue")
 # # plt.plot(dif, range(len(dif)), "x", color="red")
+
 
 # # add 1:1 line
 # min_val = min(model.train_targets[0].min().item(), preds_list[0].min().item())
@@ -391,7 +357,7 @@ while total_cost < EVAL_BUDGET * cost_func(1):
 # plt.ylabel("Surrogate")
 # plt.xlabel("Target")
 # plt.title("Surrogate vs Target Objective")
-# plt.savefig("/projects/mhpi/leoglonz/project_silmaril/iclr_examples/HV-KG/figs/surrogate_temp.png")
+# plt.savefig("/projects/mhpi/leoglonz/project_silmaril/surrogate_examples/hvkg/results/surrogate_temp.png")
 
 
 
@@ -531,7 +497,7 @@ costs = []
 for i in range(MF_n_INIT, train_x_kg.shape[0] + 1, 5):
 
     mll, model = initialize_model(
-        train_x_kg[:i], train_obj_kg[:i], train_sc_kg[:i]
+        normalize(train_x_kg[:i], BC.bounds), train_obj_kg[:i]
     )
     fit_gpytorch_mll(mll)
     hypervolume = get_pareto(model, project=project, non_fidelity_indices=[0, 1])
@@ -547,4 +513,4 @@ plt.ylabel("Log Inference Hypervolume Regret")
 plt.xlabel("Cost")
 plt.legend()
 
-plt.savefig("/projects/mhpi/leoglonz/project_silmaril/hvkg_dev/figs/hvkg1.png")
+plt.savefig("/storage/home/lgl5139/work/code/iclr25/hvkg_dev/out/figs/hvkg.png")

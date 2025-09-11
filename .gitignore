@@ -113,3 +113,5 @@ website/static/js/*
 website/static/_sphinx-sources/
 
 tutorials/j_computer.py
+
+_archive/
