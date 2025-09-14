@@ -35,7 +35,7 @@ dim_y = BC.num_objectives
 ref_point = torch.zeros(dim_y, **tkwargs) 
 print(f"Reference point used: {ref_point}")  # Should be (0,0) for this problem
 
-SEED = 356288 #np.random.randint(0, 999999) # 111111, 42, 0, 123456, 356288
+SEED = 42 #np.random.randint(0, 999999) # 111111, 42, 0, 123456, 356288
 print(SEED)
 
 BATCH_SIZE = 1  # For batch optimization, BATCH_SIZE should be greater than 1
@@ -204,11 +204,12 @@ def initialize_model(train_x, train_obj, train_sc, state_dict=None):
     """
     models = []
     for i in range(train_obj.shape[-1]):
+        subset_frac = 0.5
         if i == 0:
             lambda_reg = 1e-1
         else:
             lambda_reg = 1e1
-        lambda_reg = 0
+        # lambda_reg = 0
 
         train_Y = train_obj[:, i : i + 1]
         train_S = train_sc[:, i : i + 1]
@@ -231,6 +232,7 @@ def initialize_model(train_x, train_obj, train_sc, state_dict=None):
             scaled_train_S, # Pass the correctly scaled sensitivity targets
             # train_Yvar=torch.full_like(train_obj[:, i : i + 1], 1e-6),
             lambda_reg=lambda_reg,
+            subset_frac=subset_frac,
             outcome_transform=outcome_transform, # Pass the transform to the model
             covar_module=ScaleKernel(
                 MaternKernel(
@@ -497,8 +499,8 @@ while total_cost < EVAL_BUDGET * cost_func(1):
     # reinitialize the models so they are ready for fitting on next iteration
     mll, model = initialize_model(normalize(train_x_kg, BC.bounds), train_obj_kg, train_sc_kg)
 
-    fit_gpytorch_mll(mll=mll)  # Fit the model
-    # train_model_adam(mll)
+    # fit_gpytorch_mll(mll=mll)  # Fit the model
+    train_model_adam(mll)
 
     # model.eval()
     # with torch.no_grad():
@@ -690,8 +692,8 @@ for i in range(MF_n_INIT, train_x_kg.shape[0] + 1, 5):
     mll, model = initialize_model(
         normalize(train_x_kg[:i], BC.bounds), train_obj_kg[:i], train_sc_kg[:i]
     )
-    fit_gpytorch_mll(mll)
-    # train_model_adam(mll)
+    # fit_gpytorch_mll(mll)
+    train_model_adam(mll)
 
     hypervolume = get_pareto(model, project=project, non_fidelity_indices=[0, 1])
     hvs_kg.append(hypervolume)

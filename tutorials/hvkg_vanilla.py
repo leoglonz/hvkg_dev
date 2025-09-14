@@ -505,6 +505,8 @@ for i in range(MF_n_INIT, train_x_kg.shape[0] + 1, 5):
     costs.append(cost_callable(train_x_kg[:i]).sum().item())
 
 
+print("costs", costs)
+print("regret", np.log10(BC.max_hv - np.array(hvs_kg)))
 
 plt.plot(
     costs, np.log10(BC.max_hv - np.array(hvs_kg)), "--", marker="d", ms=10, label="HVKG"

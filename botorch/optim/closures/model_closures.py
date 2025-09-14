@@ -132,13 +132,22 @@ def _get_loss_closure_exact_internal(
 ) -> Callable[[], Tensor]:
     r"""ExactMarginalLogLikelihood loss closure with internally managed data."""
 
+    import torch
+
     def closure(**kwargs: Any) -> Tensor:
         model = mll.model
         # The inputs will get transformed in forward here.
+        
+        # x_train = model.train_inputs[0]
+        # train_s = x_train[:, -1]
+        # train_s.requires_grad_(True)
+        # model.train_inputs = (torch.cat((x_train[:,:-1], train_s.unsqueeze(-1)), dim=-1),)
+
         model_output = model(*model.train_inputs)
         log_likelihood = mll(
             model_output,
             model.train_targets,
+            # train_s,
             # During model training, the model inputs get transformed in the forward
             # pass. The train_inputs property is not transformed yet, so we need to
             # transform it before passing it to the likelihood for consistency.
