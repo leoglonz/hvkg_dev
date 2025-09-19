@@ -27,9 +27,10 @@ from gpytorch import settings
 from math import exp
 from torch import Tensor
 from botorch import fit_gpytorch_mll
+import matplotlib.pyplot as plt
 
 
-# Your custom imports
+# custom imports
 from j_computer import batchJacobian_AD
 from sc_mll import SensitivityAwareGP, SensitivityAwareMLL
 
@@ -42,6 +43,10 @@ warnings.filterwarnings("ignore", message="Very small noise values detected")
 # =============================================================================
 SMOKE_TEST = False
 NUM_REPLICATIONS = 20 # Total number of random seeds to run
+SEEDS = [0, 42, 259068, 355549, 369813, 467073, 488127, 561897, 593786, 831920, 905678, 998244, 222779, 41371, 649186, 287910, 510955, 490956, 955276, 319515] #, 806017]
+
+# SC ----
+USE_SC = True
 
 # --- BO Loop Settings ---
 BATCH_SIZE = 1
@@ -49,12 +54,12 @@ EVAL_BUDGET = 2  # In terms of the number of full-fidelity evaluations
 N_INIT = 2       # Initialization budget
 
 # --- Acqf Settings ---
-MC_SAMPLES = 128
-NUM_RESTARTS = 10
-RAW_SAMPLES = 512
+MC_SAMPLES = 2 if SMOKE_TEST else 128
+NUM_RESTARTS = 2 if SMOKE_TEST else 10
+RAW_SAMPLES = 4 if SMOKE_TEST else 512
 NUM_INNER_MC_SAMPLES = 32
-NUM_PARETO = 10
-NUM_FANTASIES = 32
+NUM_PARETO = 1 if SMOKE_TEST else 10
+NUM_FANTASIES = 2 if SMOKE_TEST else 32  # originally 8
 
 # --- Device and dtype Settings ---
 tkwargs = {
@@ -62,34 +67,60 @@ tkwargs = {
     "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
 }
 
+EVAL_RESOLUTION = 5
+
 # =============================================================================
 # Problem Setup
 # =============================================================================
 BC = MOMFBraninCurrin(negate=True).to(**tkwargs)
 dim_x = BC.dim
 dim_y = BC.num_objectives
-ref_point = torch.zeros(dim_y, **tkwargs)
+ref_point = torch.zeros(dim_y, **tkwargs) 
 
 standard_bounds = torch.zeros(2, dim_x, **tkwargs)
 standard_bounds[1] = 1
 target_fidelities = {2: 1.0} # mapping from index to target fidelity
 
+
+normalized_target_fidelities = {}
+for idx, fidelity in target_fidelities.items():
+    lb = standard_bounds[0, idx].item()
+    ub = standard_bounds[1, idx].item()
+    normalized_target_fidelities[idx] = (fidelity - lb) / (ub - lb)
+project_d = dim_x
+
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
-
 def cost_func(x):
     """A simple exponential cost function."""
     exp_arg = torch.tensor(4.8, **tkwargs)
-    return torch.exp(exp_arg * x)
+    val = torch.exp(exp_arg * x)
+    return val
+
 
 def cost_callable(X: torch.Tensor) -> torch.Tensor:
-    """Wrapper for the cost function."""
+    r"""Wrapper for the cost function that takes care of shaping
+    input and output arrays for interfacing with cost_func.
+    This is passed as a callable function to MOMF.
+
+    Args:
+        X: A `batch_shape x q x d`-dim Tensor
+    Returns:
+        Cost `batch_shape x q x m`-dim Tensor of cost generated
+        from fidelity dimension using cost_func.
+    """
+
     return cost_func(X[..., -1:])
 
+
 def inv_transform(u):
-    """Inverse transform to sample fidelities inversely proportional to cost."""
+    # define inverse transform to sample from the probability distribution with
+    # PDF proportional to 1/(c(x))
+    # u is a uniform(0,1) rv
     return 5 / 24 * torch.log(-exp(24 / 5) / (exp(24 / 5) * u - u - exp(24 / 5)))
+
 
 def gen_init_data(n: int):
     r"""
@@ -136,7 +167,8 @@ def gen_init_data(n: int):
 
     return train_x, train_obj, train_sc
 
-def initialize_model(train_x, train_obj, train_sc, state_dict=None):
+
+def initialize_model(train_x, train_obj, train_sc, state_dict=None, eval=False):
     """
     Initializes a ModelList with standardized outputs for stability.
     """
@@ -147,7 +179,9 @@ def initialize_model(train_x, train_obj, train_sc, state_dict=None):
             lambda_reg = 1e-1
         else:
             lambda_reg = 1e1
-        # lambda_reg = 0
+        
+        if (not USE_SC) or (eval):
+            lambda_reg = 0
 
         train_Y = train_obj[:, i : i + 1]
         train_S = train_sc[:, i : i + 1]
@@ -196,58 +230,6 @@ def initialize_model(train_x, train_obj, train_sc, state_dict=None):
     if state_dict is not None:
         model.load_state_dict(state_dict=state_dict)
     return mll, model
-
-
-def train_model_adam(mll, training_steps=400, learning_rate=0.01):
-    """
-    Custom two-phase training loop for improved stability and performance.
-    """
-    # Phase 1: Pre-training on MLL only
-    # This finds good general hyperparameters before introducing the sensitive term.
-    pretrain_steps = int(training_steps * 0.75)
-    
-    # Phase 2: Fine-tuning with the full, regularized loss
-    finetune_steps = training_steps - pretrain_steps
-
-    optimizer = torch.optim.Adam(mll.model.parameters(), lr=learning_rate)
-    model = mll.model
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
-    
-    model.train()
-    
-    # --- Phase 1: MLL Pre-training ---
-    print("--- Starting Phase 1: MLL Pre-training ---")
-    for i in range(pretrain_steps):
-        optimizer.zero_grad()
-        output = model(*model.train_inputs)
-        
-        # We need to get the MLL from each individual model in the ModelListGP
-        # and then sum them up. We can't call mll() directly here.
-        pretrain_loss = 0
-        for j, single_model in enumerate(model.models):
-            pretrain_loss -= single_model.likelihood(output[j], single_model.train_targets).mean.sum()
-
-        if not torch.isfinite(pretrain_loss):
-            print(f"Warning: Non-finite loss in Phase 1 at step {i}. Stopping.")
-            break
-        pretrain_loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-    # --- Phase 2: Sensitivity Fine-tuning ---
-    print("--- Starting Phase 2: Sensitivity Fine-tuning ---")
-    for i in range(finetune_steps):
-        optimizer.zero_grad()
-        output = model(*model.train_inputs)
-        # Now use the full, regularized MLL object
-        loss = -mll(output, model.train_targets)
-        
-        if not torch.isfinite(loss):
-            print(f"Warning: Non-finite loss in Phase 2 at step {i}. Stopping.")
-            break
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
 
 
 def get_current_value(
@@ -305,6 +287,7 @@ def optimize_HVKG_and_get_obs(
     standard_bounds: torch.Tensor,
     BATCH_SIZE: int,
     cost_call: Callable[[torch.Tensor], torch.Tensor],
+    normalized_target_fidelities,
 ):
     """Utility to initialize and optimize HVKG."""
     cost_model = GenericDeterministicModel(cost_call)
@@ -359,6 +342,65 @@ def optimize_HVKG_and_get_obs(
 
     return new_x, new_obj, new_sc
 
+
+def train_model_adam(mll, training_steps=400, learning_rate=0.01):
+    """
+    Custom two-phase training loop for improved stability and performance.
+    """
+    # Phase 1: Pre-training on MLL only
+    # This finds good general hyperparameters before introducing the sensitive term.
+    pretrain_steps = int(training_steps * 0.75)
+    
+    # Phase 2: Fine-tuning with the full, regularized loss
+    finetune_steps = training_steps - pretrain_steps
+
+    optimizer = torch.optim.Adam(mll.model.parameters(), lr=learning_rate)
+    model = mll.model
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    
+    model.train()
+    
+    # --- Phase 1: MLL Pre-training ---
+    print("--- Starting Phase 1: MLL Pre-training ---")
+    for i in range(pretrain_steps):
+        optimizer.zero_grad()
+        output = model(*model.train_inputs)
+        
+        # We need to get the MLL from each individual model in the ModelListGP
+        # and then sum them up. We can't call mll() directly here.
+        pretrain_loss = 0
+        for j, single_model in enumerate(model.models):
+            pretrain_loss -= single_model.likelihood(output[j], single_model.train_targets).mean.sum()
+
+        if not torch.isfinite(pretrain_loss):
+            print(f"Warning: Non-finite loss in Phase 1 at step {i}. Stopping.")
+            break
+        pretrain_loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+    # --- Phase 2: Sensitivity Fine-tuning ---
+    print("--- Starting Phase 2: Sensitivity Fine-tuning ---")
+    for i in range(finetune_steps):
+        optimizer.zero_grad()
+        output = model(*model.train_inputs)
+        # Now use the full, regularized MLL object
+        loss = -mll(output, model.train_targets)
+        
+        if not torch.isfinite(loss):
+            print(f"Warning: Non-finite loss in Phase 2 at step {i}. Stopping.")
+            break
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+
+
+from botorch.utils.multi_objective.pareto import (
+    _is_non_dominated_loop,
+    is_non_dominated,
+)
+from gpytorch import settings
 
 try:
     # Note: These are the pymoo 0.6+ imports, if you happen to be stuck on
@@ -472,7 +514,7 @@ except ImportError:
                 ).mean.squeeze(-2)
                 preds_list.append(preds)
             preds = torch.cat(preds_list, dim=0)
-            pareto_mask = is_non_dominated(preds)
+            pareto_mask = _is_non_dominated_loop(preds)
             pareto_X = discrete_set[pareto_mask]
         if not is_mf_model:
             pareto_X = project(pareto_X)
@@ -483,66 +525,60 @@ except ImportError:
         return partitioning.compute_hypervolume().item()
 
 
-normalized_target_fidelities = {}
-for idx, fidelity in target_fidelities.items():
-    lb = standard_bounds[0, idx].item()
-    ub = standard_bounds[1, idx].item()
-    normalized_target_fidelities[idx] = (fidelity - lb) / (ub - lb)
-project_d = dim_x
-
 
 # =============================================================================
 # Main Experiment Function
 # =============================================================================
 
 def run_full_experiment(seed: int, output_dir: str = "out"):
-    """
-    Runs a single, full HV-KG optimization loop for a given random seed.
-
-    Args:
-        seed: The random seed for this replication.
-        output_dir: The base directory to save results.
-    """
     print(f"\n--- Starting Experiment for Seed {seed} ---")
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    
     # --- Create a unique directory for this run's results ---
-    run_output_dir = os.path.join(output_dir, f"run_{seed}")
+    if USE_SC:
+        run_output_dir = os.path.join(output_dir, 'with_sc')
+    else:
+        run_output_dir = os.path.join(output_dir, 'vanilla')
+    
+    run_output_dir = os.path.join(run_output_dir, f"run_{seed}")
     os.makedirs(run_output_dir, exist_ok=True)
     training_costs_path = os.path.join(run_output_dir, "training_costs.txt")
     eval_results_path = os.path.join(run_output_dir, "evaluation_results.txt")
 
-    # --- Initialization ---
+
+    # --- Main script ---
     train_x_kg, train_obj_kg, train_sc_kg = gen_init_data(N_INIT)
-    initial_cost = cost_callable(train_x_kg).sum().item()
-    total_cost = initial_cost
+    MF_n_INIT = train_x_kg.shape[0]
+    total_cost = cost_callable(train_x_kg).sum().item()
+
+    # Store the cumulative cost at each iter
+    training_costs_over_time = [total_cost]
+
     iteration = 0
-    
-    # Store the cumulative cost at each iteration
-    training_costs_over_time = [initial_cost]
 
     # --- Main BO Loop ---
-    while total_cost < EVAL_BUDGET * cost_func(torch.tensor(1.0)):
+    while total_cost < EVAL_BUDGET * cost_func(1):
         print(f"Seed {seed}, Iteration {iteration}, Cost: {total_cost:.2f}")
 
-        # Reinitialize the models
+        # reinitialize the models so they are ready for fitting on next iteration
         mll, model = initialize_model(normalize(train_x_kg, BC.bounds), train_obj_kg, train_sc_kg)
-        
-        # fit_gpytorch_mll(mll=mll)  # Fit the model
-        train_model_adam(mll)
 
-        # Optimize acquisition function and get new observations
+        if USE_SC:
+            train_model_adam(mll=mll)
+        else:
+            fit_gpytorch_mll(mll=mll)  # Fit the model
+
         new_x, new_obj, new_sc = optimize_HVKG_and_get_obs(
             model=model,
             ref_point=ref_point,
             standard_bounds=standard_bounds,
             BATCH_SIZE=BATCH_SIZE,
             cost_call=cost_callable,
+            normalized_target_fidelities=normalized_target_fidelities,
         )
 
-        # Update training data
+        # Updating train data
         train_x_kg = torch.cat([train_x_kg, new_x], dim=0)
         train_obj_kg = torch.cat([train_obj_kg, new_obj], dim=0)
         train_sc_kg = torch.cat([train_sc_kg, new_sc], dim=0)
@@ -553,54 +589,60 @@ def run_full_experiment(seed: int, output_dir: str = "out"):
         training_costs_over_time.append(total_cost)
 
     print(f"Seed {seed} finished. Final cost: {total_cost:.2f}")
+    print(f"Cost threshold exceeded: {total_cost} >> {EVAL_BUDGET * cost_func(1)}")
 
     # --- Save training costs ---
     np.savetxt(training_costs_path, np.array(training_costs_over_time), fmt="%.6f")
+
 
     # --- Evaluation Phase ---
     print(f"--- Seed {seed}: Starting Evaluation Phase ---")
     hvs_kg = []
     costs_at_eval = []
-    MF_n_INIT = train_x_kg.shape[0] - iteration # Number of initial points
 
     # Checkpoint at every 5 iterations
-    for i in range(MF_n_INIT, train_x_kg.shape[0] + 1, 5):
-        if i == 0: continue # Skip if no data
-        
+    for i in range(MF_n_INIT, train_x_kg.shape[0] + 1, EVAL_RESOLUTION):
         mll, model = initialize_model(
-            normalize(train_x_kg[:i], BC.bounds), train_obj_kg[:i], train_sc_kg[:i]
+            normalize(train_x_kg[:i], BC.bounds), train_obj_kg[:i], train_sc_kg[:i], eval=True,
         )
-        if EXP == 'vanilla':
-            train_model_adam(mll)
-        else:
-            # fit_gpytorch_mll(mll)
+
+        # if USE_SC:
+        #     train_model_adam(mll=mll)
+        # else:
+        fit_gpytorch_mll(mll=mll)  # Fit the model
 
         hypervolume = get_pareto(model, project=project, non_fidelity_indices=[0, 1])
         hvs_kg.append(hypervolume)
         costs_at_eval.append(cost_callable(train_x_kg[:i]).sum().item())
-    
+
     costs_at_eval = np.array(costs_at_eval)
     regret = np.log10(BC.max_hv - np.array(hvs_kg))
 
     # --- Save evaluation results ---
-    # Each row in the file will be: cost, regret
     eval_results = np.stack([costs_at_eval, regret], axis=1)
     np.savetxt(eval_results_path, eval_results, fmt="%.6f", header="Cost Regret")
+
+    plt.plot(
+        costs_at_eval, np.log10(BC.max_hv - np.array(hvs_kg)), "--", marker="d", ms=10, label="HVKG"
+    )
+    plt.ylabel("Log Inference Hypervolume Regret")
+    plt.xlabel("Cost")
+    plt.savefig(os.path.join(run_output_dir, 'cost-regret.png'))
+    plt.close()
     print(f"Results for seed {seed} saved to {run_output_dir}")
 
 
+
 # =============================================================================
-# Script Runner
+# Main
 # =============================================================================
 
 if __name__ == "__main__":
-    seeds = [42, 259068, 355549, 369813, 467073, 488127, 561897, 593786, 831920, 905678, 998244]
     if SMOKE_TEST:
         print("Running in smoke test mode (1 replication).")
         run_full_experiment(seed=0)
     else:
         print(f"Starting full experiment with {NUM_REPLICATIONS} replications.")
-        for i in range(len(seeds)):
-            # np.random.randint(0, 999999)
-            run_full_experiment(seed=seeds[i])
+        for i in range(NUM_REPLICATIONS):
+            run_full_experiment(seed=SEEDS[i])
     print("\n--- All experiments complete. ---")
