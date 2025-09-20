@@ -64,10 +64,10 @@ NUM_FANTASIES = 2 if SMOKE_TEST else 32  # originally 8
 # --- Device and dtype Settings ---
 tkwargs = {
     "dtype": torch.double,
-    "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+    "device": torch.device("cuda:1" if torch.cuda.is_available() else "cpu"),
 }
 
-EVAL_RESOLUTION = 5
+EVAL_RESOLUTION = 1
 
 # =============================================================================
 # Problem Setup
@@ -343,35 +343,38 @@ def optimize_HVKG_and_get_obs(
     return new_x, new_obj, new_sc
 
 
-def train_model_adam(mll, training_steps=400, learning_rate=0.01):
+def train_model_adam(mll, training_steps=400, learning_rate=0.01, is_online_finetune=False):
     """
     Custom two-phase training loop for improved stability and performance.
+    If online_finetune is True, it will only perform the fine-tuning phase.
     """
-    # Phase 1: Pre-training on MLL only
-    # This finds good general hyperparameters before introducing the sensitive term.
+
+    # If it's a fine-tuning step, we can use fewer steps.
+    # if is_online_finetune:
+    #     training_steps = 100 #int(training_steps / 4) # e.g., 100 steps for fine-tuning
+    #     pretrain_steps = 50
+    #     finetune_steps = training_steps
+    #     learning_rate = 0.001
+    # else:
     pretrain_steps = int(training_steps * 0.75)
-    
-    # Phase 2: Fine-tuning with the full, regularized loss
     finetune_steps = training_steps - pretrain_steps
 
     optimizer = torch.optim.Adam(mll.model.parameters(), lr=learning_rate)
     model = mll.model
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
-    
     model.train()
-    
-    # --- Phase 1: MLL Pre-training ---
+
+    # --- Phase 1: MLL Pre-training (skipped if fine-tuning) ---
+    # if not is_online_finetune:
     print("--- Starting Phase 1: MLL Pre-training ---")
     for i in range(pretrain_steps):
         optimizer.zero_grad()
         output = model(*model.train_inputs)
         
-        # We need to get the MLL from each individual model in the ModelListGP
-        # and then sum them up. We can't call mll() directly here.
         pretrain_loss = 0
         for j, single_model in enumerate(model.models):
             pretrain_loss -= single_model.likelihood(output[j], single_model.train_targets).mean.sum()
-
+        
         if not torch.isfinite(pretrain_loss):
             print(f"Warning: Non-finite loss in Phase 1 at step {i}. Stopping.")
             break
@@ -384,16 +387,14 @@ def train_model_adam(mll, training_steps=400, learning_rate=0.01):
     for i in range(finetune_steps):
         optimizer.zero_grad()
         output = model(*model.train_inputs)
-        # Now use the full, regularized MLL object
         loss = -mll(output, model.train_targets)
-        
         if not torch.isfinite(loss):
             print(f"Warning: Non-finite loss in Phase 2 at step {i}. Stopping.")
             break
         loss.backward()
         optimizer.step()
         scheduler.step()
-
+    model.eval()
 
 
 from botorch.utils.multi_objective.pareto import (
@@ -539,7 +540,7 @@ def run_full_experiment(seed: int, output_dir: str = "out"):
     if USE_SC:
         run_output_dir = os.path.join(output_dir, 'with_sc_online')
     else:
-        run_output_dir = os.path.join(output_dir, 'vanilla')
+        run_output_dir = os.path.join(output_dir, 'vanilla_online')
     
     run_output_dir = os.path.join(run_output_dir, f"run_{seed}")
     os.makedirs(run_output_dir, exist_ok=True)
@@ -567,7 +568,7 @@ def run_full_experiment(seed: int, output_dir: str = "out"):
         # mll, model = initialize_model(normalize(train_x_kg, BC.bounds), train_obj_kg, train_sc_kg)
         
         if USE_SC:
-            train_model_adam(mll=mll)
+            train_model_adam(mll=mll, is_online_finetune=True)
         else:
             fit_gpytorch_mll(mll=mll)  # Fit the model
 

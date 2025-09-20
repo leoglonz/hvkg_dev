@@ -46,7 +46,7 @@ NUM_REPLICATIONS = 20 # Total number of random seeds to run
 SEEDS = [0, 42, 259068, 355549, 369813, 467073, 488127, 561897, 593786, 831920, 905678, 998244, 222779, 41371, 649186, 287910, 510955, 490956, 955276, 319515] #, 806017]
 
 # SC ----
-USE_SC = True
+USE_SC = False
 
 # --- BO Loop Settings ---
 BATCH_SIZE = 1
@@ -64,10 +64,10 @@ NUM_FANTASIES = 2 if SMOKE_TEST else 32  # originally 8
 # --- Device and dtype Settings ---
 tkwargs = {
     "dtype": torch.double,
-    "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+    "device": torch.device("cuda:1" if torch.cuda.is_available() else "cpu"),
 }
 
-EVAL_RESOLUTION = 5
+EVAL_RESOLUTION = 1  # 5
 
 # =============================================================================
 # Problem Setup
